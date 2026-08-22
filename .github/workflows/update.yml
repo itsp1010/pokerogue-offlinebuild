@@ -1,0 +1,116 @@
+name: Build and Package Game
+
+on:
+  schedule:
+    - cron: '*/180 * * * *'
+  push:
+    branches: [main]
+
+jobs:
+  build-main:
+    runs-on: ubuntu-latest
+
+    env:
+      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
+    steps:
+    - name: Checkout original repository
+      uses: actions/checkout@v5
+      with:
+        repository: pagefaultgames/pokerogue
+        ref: main
+        submodules: 'recursive'
+
+    - name: Get latest commit hash
+      id: latest_commit
+      run: |
+        latest_commit=$(git log --pretty=format:'%h' -n 1)
+        echo "latest_commit=$latest_commit" >> $GITHUB_OUTPUT
+
+    - name: Get pagefault/pokerogue latest release tag
+      id: get_release
+      run: |
+        response=$(curl -s -H "Authorization: token $RELEASE_TOKEN" \
+        "https://api.github.com/repos/pagefaultgames/pokerogue/releases")
+        page_release_tag=$(echo "$response" | jq -r '.[0].tag_name')
+        echo "current_release=$page_release_tag" >> $GITHUB_OUTPUT
+
+    - name: Check if release tag from pagefault already exists in this repository
+      id: check_match
+      run: |
+        page_tag="${{ steps.get_release.outputs.current_release }}"
+        repo="${GITHUB_REPOSITORY}"
+        echo "Pagefault release tag: $page_tag"
+        status=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $RELEASE_TOKEN" "https://api.github.com/repos/${repo}/releases/tags/${page_tag}")
+        if [ "$status" -eq 200 ]; then
+          echo "stop_build=true" >> $GITHUB_OUTPUT
+        else
+          echo "stop_build=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Setup pnpm
+      uses: pnpm/action-setup@v4
+        
+    - name: Install Dependencies
+      run: pnpm i --frozen-lockfile
+
+    - name: Set up Node.js
+      if: steps.check_match.outputs.stop_build != 'true'
+      uses: actions/setup-node@v5
+      with:
+        node-version: '>=24.9.0'
+        cache: pnpm
+
+    - name: Install dependencies
+      if: steps.check_match.outputs.stop_build != 'true'
+      run: pnpm install
+
+    - name: Build game
+      if: steps.check_match.outputs.stop_build != 'true'
+      run: pnpm build:app
+
+    - name: Package game
+      if: steps.check_match.outputs.stop_build != 'true'
+      run: |
+        cd dist
+        echo ${{ steps.latest_commit.outputs.latest_commit }} > currentVersion.txt
+        zip -r game.zip .
+
+    - name: Create Release
+      if: steps.check_match.outputs.stop_build != 'true'
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+      with:
+        tag_name: ${{ steps.get_release.outputs.current_release }}
+        release_name: ${{ steps.get_release.outputs.current_release }}
+        draft: false
+        prerelease: false
+
+    - name: Upload Release Asset
+      if: steps.check_match.outputs.stop_build != 'true'
+      id: upload-release-asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./dist/game.zip
+        asset_name: game.zip
+        asset_content_type: application/zip
+
+    - name: Gets latest created release info
+      id: latest_release_info
+      uses: jossef/action-latest-release-info@v1.2.1
+      env:
+        GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
+    - name: Delete old releases
+      if: needs.build-main.outputs.stop_build != 'true'
+      uses: dev-drprasad/delete-older-releases@v0.3.3
+      with:
+        keep_latest: 1
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
